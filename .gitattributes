@@ -1,0 +1,2 @@
+transmodel/*.onnx filter=lfs diff=lfs merge=lfs -text
+transmodel/*.rknn filter=lfs diff=lfs merge=lfs -text

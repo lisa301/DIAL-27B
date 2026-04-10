@@ -1,0 +1,6 @@
+worker0:
+  host: '127.0.0.1:10128'
+  description: 'local example'
+  layers:
+    - 'model.language_model.layers.0-35'
+
