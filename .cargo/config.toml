@@ -1,4 +1,6 @@
 
-# https://github.com/huggingface/candle/issues/1625
+# candle-core 0.11 uses unstable stdarch float16 vector types when the Rust
+# `fp16` target feature is enabled on stable aarch64. Keep native tuning while
+# selecting Candle's stable f16-to-f32 NEON fallback.
 [target.'cfg(any(target_arch = "arm", target_arch = "aarch64"))']
-rustflags = ["-C", "target-feature=+fp16"]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=-fp16"]

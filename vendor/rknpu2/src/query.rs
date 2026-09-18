@@ -10,7 +10,9 @@ pub trait Query: From<Self::Output> + Sized {
 }
 
 pub mod in_out_num;
+pub mod current_output_attr;
 pub mod input_attr;
+pub mod input_dynamic_range;
 pub mod native_input_attr;
 pub mod native_nc1hwc2_input_attr;
 pub mod native_nc1hwc2_output_attr;
@@ -37,6 +39,7 @@ pub mod perf_detail;
 use crate::tensor::{DataTypeKind, QuantTypeKind, TensorFormatKind};
 
 pub use {
+    current_output_attr::CurrentOutputAttr,
     in_out_num::InputOutputNum, native_input_attr::NativeInputAttr,
     native_nc1hwc2_input_attr::NativeNC1HWC2InputAttr,
     native_nc1hwc2_output_attr::NativeNC1HWC2OutputAttr,
@@ -68,7 +71,11 @@ pub trait QueryWithInput: From<Self::Output> + Sized {
     fn prepare(input: Self::Input, output: &mut Self::Output);
 }
 
-pub use {input_attr::InputAttr, output_attr::OutputAttr};
+pub use {
+    input_attr::InputAttr,
+    input_dynamic_range::InputDynamicRange,
+    output_attr::OutputAttr,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Io {

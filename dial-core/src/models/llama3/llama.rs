@@ -209,15 +209,16 @@ impl Generator for LLama {
         log::info!("loading {} blocks ...", ctx.config.num_hidden_layers);
 
         let mut blocks: Vec<Box<dyn Forwarder>> = vec![];
+        let mut worker_connections = crate::spm::ClientPool::default();
 
         for i in 0..ctx.config.num_hidden_layers {
             let block_layer_name = format!("model.layers.{i}");
             if let Some((node_name, node)) = ctx.topology.get_node_for_layer(&block_layer_name) {
                 log::debug!("node {node_name} will serve {}", &block_layer_name);
-                blocks.push(Box::new(
-                    crate::spm::Client::new(ctx.device.clone(), &node.host, &block_layer_name)
-                        .await?,
-                ));
+                let client = worker_connections
+                    .client_for_layer(ctx.device.clone(), &node.host, &block_layer_name)
+                    .await?;
+                blocks.push(Box::new(client));
             } else {
                 log::debug!("{} will be served locally", &block_layer_name);
                 blocks.push(Transformer::load(

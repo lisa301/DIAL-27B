@@ -113,11 +113,7 @@ impl VitAttention {
 
         let y = {
             let in_dtype = q.dtype();
-            let compute_dtype = if self.attn_f32 {
-                DType::F32
-            } else {
-                in_dtype
-            };
+            let compute_dtype = if self.attn_f32 { DType::F32 } else { in_dtype };
             let q = if compute_dtype == in_dtype {
                 q
             } else {
@@ -381,7 +377,6 @@ pub fn image_to_tensor(rgb: &[u8], h: usize, w: usize, device: &Device) -> Resul
     Ok(t.unsqueeze(0)?)
 }
 
-
 impl VisionEncoder {
     /// （新增）对外暴露必要的视觉配置参数，避免在上层直接访问私有字段。
     /// 为什么要加：图片缩放需要知道 patch_size / spatial_merge_size / num_position_embeddings 才能
@@ -511,9 +506,7 @@ impl VisionEncoder {
         let rows: Vec<u32> = (0..hp)
             .flat_map(|r| std::iter::repeat(r as u32).take(wp))
             .collect();
-        let cols: Vec<u32> = (0..hp)
-            .flat_map(|_| (0..wp).map(|c| c as u32))
-            .collect();
+        let cols: Vec<u32> = (0..hp).flat_map(|_| (0..wp).map(|c| c as u32)).collect();
 
         let row = Tensor::from_vec(rows, hp * wp, device)?
             .to_dtype(DType::F32)?
@@ -555,30 +548,84 @@ impl VisionEncoder {
 
     /// Convert an RGB image tensor in `[H,W,3]` (u8 or f32) into a model input tensor `[1,3,H,W]` (f32),
     /// applying `(x/255 - mean)/std` with mean/std 0.5.
-    pub fn image_to_tensor(&self, rgb: &[u8], h: usize, w: usize, device: &Device) -> Result<Tensor> {
+    pub fn image_to_tensor(
+        &self,
+        rgb: &[u8],
+        h: usize,
+        w: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
         image_to_tensor(rgb, h, w, device)
     }
 
-
     /// Encode an image input tensor `[1,3,H,W]` into projected features plus deepstack side outputs.
     pub fn encode(&self, image: &Tensor) -> Result<VisionOutputs> {
+        let image = if self.cfg.temporal_patch_size <= 1 {
+            image.clone()
+        } else {
+            let temporal = self.cfg.temporal_patch_size;
+            let frames = image.repeat((temporal, 1, 1, 1))?;
+            self.pack_temporal_channels(&frames)?
+        };
+        self.encode_packed(&image)
+    }
+
+    /// Encode one consecutive temporal patch `[T,3,H,W]` without sampling frames.
+    pub fn encode_video_patch(&self, frames: &Tensor) -> Result<VisionOutputs> {
+        let (temporal, channels, _h, _w) = frames
+            .dims4()
+            .map_err(|e| anyhow!("video patch dims4 -> {e}"))?;
+        if temporal != self.cfg.temporal_patch_size || channels != self.cfg.in_channels {
+            bail!(
+                "video patch shape must be [{},{},H,W], got {:?}",
+                self.cfg.temporal_patch_size,
+                self.cfg.in_channels,
+                frames.dims()
+            );
+        }
+        self.encode_video_patches(&frames.unsqueeze(0)?)
+    }
+
+    /// Encode a batch of consecutive temporal patches `[B,T,3,H,W]`.
+    ///
+    /// Each temporal patch remains an independent spatial attention sequence,
+    /// matching Qwen3-VL's video processor while amortizing ViT kernel setup.
+    pub fn encode_video_patches(&self, frames: &Tensor) -> Result<VisionOutputs> {
+        let (batch, temporal, channels, h, w) = frames
+            .dims5()
+            .map_err(|e| anyhow!("video patches dims5 -> {e}"))?;
+        if temporal != self.cfg.temporal_patch_size || channels != self.cfg.in_channels {
+            bail!(
+                "video patches shape must be [B,{}, {},H,W], got {:?}",
+                self.cfg.temporal_patch_size,
+                self.cfg.in_channels,
+                frames.dims()
+            );
+        }
+        let packed =
+            frames
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((batch, channels * temporal, h, w))?;
+        self.encode_packed(&packed)
+    }
+
+    fn pack_temporal_channels(&self, frames: &Tensor) -> Result<Tensor> {
+        let (temporal, channels, h, w) = frames.dims4()?;
+        // Conv3d weights are flattened in C-major, then T order.
+        Ok(frames
+            .transpose(0, 1)?
+            .contiguous()?
+            .reshape((1, channels * temporal, h, w))?)
+    }
+
+    fn encode_packed(&self, image: &Tensor) -> Result<VisionOutputs> {
         let t0 = Instant::now();
         let (_b, _c, h, w) = image.dims4().map_err(|e| anyhow!("image dims4 -> {e}"))?;
 
         // Patch embedding.
         let t_patch = Instant::now();
-        let x = if self.cfg.temporal_patch_size <= 1 {
-            self.patch.forward(image)?
-        } else {
-            let t = self.cfg.temporal_patch_size;
-            let mut frames: Vec<Tensor> = Vec::with_capacity(t);
-            for _ in 0..t {
-                frames.push(image.clone());
-            }
-            let frame_refs: Vec<&Tensor> = frames.iter().collect();
-            let image = Tensor::cat(&frame_refs, 1)?; // (1, 3*T, h, w)
-            self.patch.forward(&image)?
-        }; // (1, hidden, h', w')
+        let x = self.patch.forward(image)?; // (1, hidden, h', w')
 
         let (_b, _hidden, hp0, wp0) = x.dims4()?;
         let patch_s = t_patch.elapsed().as_secs_f64();

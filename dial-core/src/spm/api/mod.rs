@@ -1,7 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use actix_web::web;
 use actix_web::App;
@@ -19,7 +17,8 @@ use tokio_stream::StreamExt;
 use crate::models::chat::Message;
 use crate::models::Generator;
 
-use super::{snapshot_distributed_profile, Master};
+use super::worker::collect_worker_metrics;
+use super::{probe_worker, snapshot_distributed_profile, Master, Topology};
 
 #[derive(Deserialize)]
 struct Request {
@@ -53,6 +52,8 @@ struct Response {
     /// （新增）解码阶段平均生成速率（tokens/s），使用 (生成token数-1) / (total_s-ttft_s) 计算。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_tokens_per_second: Option<f64>,
+    /// Number of tokens emitted before EOS or the configured sample limit.
+    pub generated_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distributed_overhead_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,11 +92,258 @@ struct StreamResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_tokens_per_second: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub distributed_overhead_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_compute_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_requests: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct WorkerStatus {
+    role: String,
+    name: String,
+    host: String,
+    description: Option<String>,
+    layers: Vec<String>,
+    active: bool,
+    online: bool,
+    state: String,
+    version: Option<String>,
+    dtype: Option<String>,
+    os: Option<String>,
+    arch: Option<String>,
+    device: Option<String>,
+    device_idx: Option<usize>,
+    latency_ms: Option<u64>,
+    worker_latency_ms: Option<u64>,
+    cpu_usage_percent: Option<f32>,
+    memory_usage_percent: Option<f32>,
+    npu_usage_percent: Option<f32>,
+    temperature_c: Option<f32>,
+    system_model: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MasterStatus {
+    role: String,
+    name: String,
+    host: String,
+    description: String,
+    active: bool,
+    online: bool,
+    state: String,
+    version: String,
+    dtype: String,
+    os: String,
+    arch: String,
+    device: String,
+    device_idx: usize,
+    cpu_usage_percent: Option<f32>,
+    memory_usage_percent: Option<f32>,
+    npu_usage_percent: Option<f32>,
+    temperature_c: Option<f32>,
+    system_model: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TopologyStatus {
+    master_api: String,
+    master: MasterStatus,
+    topology_path: String,
+    configured_workers: usize,
+    active_workers: usize,
+    online_workers: usize,
+    reload_required: bool,
+    workers: Vec<WorkerStatus>,
+}
+
+async fn topology<G>(state: web::Data<Arc<RwLock<Master<G>>>>) -> impl Responder
+where
+    G: Generator + Send + Sync + 'static,
+{
+    let (
+        master_api,
+        topology_path,
+        active_topology,
+        master_dtype,
+        master_device,
+        master_device_idx,
+    ) = {
+        let master = state.read().await;
+        (
+            master.ctx.args.api.clone().unwrap_or_default(),
+            master.ctx.args.topology.clone(),
+            master.ctx.topology.clone(),
+            format!("{:?}", master.ctx.dtype),
+            if master.ctx.device.is_cuda() {
+                "cuda".to_string()
+            } else if master.ctx.device.is_metal() {
+                "metal".to_string()
+            } else {
+                "cpu".to_string()
+            },
+            master.ctx.args.device,
+        )
+    };
+    let master_metrics = collect_worker_metrics(master_device_idx);
+    let master_status = MasterStatus {
+        role: "master".to_string(),
+        name: "Master".to_string(),
+        host: master_api.clone(),
+        description: "DIAL 调度与本地推理节点".to_string(),
+        active: true,
+        online: true,
+        state: "online".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        dtype: master_dtype,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        device: master_device,
+        device_idx: master_device_idx,
+        cpu_usage_percent: master_metrics.cpu_usage_percent,
+        memory_usage_percent: master_metrics.memory_usage_percent,
+        npu_usage_percent: master_metrics.npu_usage_percent,
+        temperature_c: master_metrics.temperature_c,
+        system_model: master_metrics.system_model,
+    };
+
+    // Reload the configured topology for observability. Newly configured
+    // workers appear immediately, while `active` tells callers whether the
+    // running Master already loaded the same worker at startup.
+    let configured_topology = match Topology::from_path_silent(&topology_path) {
+        Ok(topology) => topology,
+        Err(error) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("failed to load topology: {error}"),
+                "topology_path": topology_path,
+            }));
+        }
+    };
+
+    let mut configured = configured_topology
+        .iter()
+        .map(|(name, node)| (name.clone(), node.clone()))
+        .collect::<Vec<_>>();
+    configured.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut probes = Vec::with_capacity(configured.len());
+    for (name, node) in configured {
+        let active = active_topology
+            .get(&name)
+            .map(|active_node| active_node.host == node.host && active_node.layers == node.layers)
+            .unwrap_or(false);
+        probes.push(tokio::spawn(async move {
+            let started = Instant::now();
+            let probe =
+                tokio::time::timeout(Duration::from_millis(900), probe_worker(&node.host)).await;
+            let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+            match probe {
+                Ok(Ok(info)) => WorkerStatus {
+                    role: "worker".to_string(),
+                    name,
+                    host: node.host,
+                    description: node.description,
+                    layers: node.layers,
+                    active,
+                    online: true,
+                    state: if active {
+                        "online".to_string()
+                    } else {
+                        "standby".to_string()
+                    },
+                    version: Some(info.version),
+                    dtype: Some(info.dtype),
+                    os: Some(info.os),
+                    arch: Some(info.arch),
+                    device: Some(info.device),
+                    device_idx: Some(info.device_idx),
+                    latency_ms: Some(latency_ms),
+                    worker_latency_ms: Some(info.latency.min(u64::MAX as u128) as u64),
+                    cpu_usage_percent: info.cpu_usage_percent,
+                    memory_usage_percent: info.memory_usage_percent,
+                    npu_usage_percent: info.npu_usage_percent,
+                    temperature_c: info.temperature_c,
+                    system_model: info.system_model,
+                    error: None,
+                },
+                Ok(Err(error)) => WorkerStatus {
+                    role: "worker".to_string(),
+                    name,
+                    host: node.host,
+                    description: node.description,
+                    layers: node.layers,
+                    active,
+                    online: false,
+                    state: "offline".to_string(),
+                    version: None,
+                    dtype: None,
+                    os: None,
+                    arch: None,
+                    device: None,
+                    device_idx: None,
+                    latency_ms: None,
+                    worker_latency_ms: None,
+                    cpu_usage_percent: None,
+                    memory_usage_percent: None,
+                    npu_usage_percent: None,
+                    temperature_c: None,
+                    system_model: None,
+                    error: Some(error.to_string()),
+                },
+                Err(_) => WorkerStatus {
+                    role: "worker".to_string(),
+                    name,
+                    host: node.host,
+                    description: node.description,
+                    layers: node.layers,
+                    active,
+                    online: false,
+                    state: "offline".to_string(),
+                    version: None,
+                    dtype: None,
+                    os: None,
+                    arch: None,
+                    device: None,
+                    device_idx: None,
+                    latency_ms: None,
+                    worker_latency_ms: None,
+                    cpu_usage_percent: None,
+                    memory_usage_percent: None,
+                    npu_usage_percent: None,
+                    temperature_c: None,
+                    system_model: None,
+                    error: Some("worker probe timed out after 900 ms".to_string()),
+                },
+            }
+        }));
+    }
+
+    let mut workers = Vec::with_capacity(probes.len());
+    for probe in probes {
+        match probe.await {
+            Ok(status) => workers.push(status),
+            Err(error) => log::warn!("topology probe task failed: {}", error),
+        }
+    }
+
+    let active_workers = workers.iter().filter(|worker| worker.active).count();
+    let online_workers = workers.iter().filter(|worker| worker.online).count();
+    let reload_required = workers.iter().any(|worker| !worker.active);
+    HttpResponse::Ok().json(TopologyStatus {
+        master_api,
+        master: master_status,
+        topology_path,
+        configured_workers: workers.len(),
+        active_workers,
+        online_workers,
+        reload_required,
+        workers,
+    })
 }
 
 impl Response {
@@ -106,6 +354,7 @@ impl Response {
         total_s: f64,
         tokens_per_second: Option<f64>,
         decode_tokens_per_second: Option<f64>,
+        generated_tokens: usize,
         distributed_overhead_s: Option<f64>,
         remote_compute_s: Option<f64>,
         remote_requests: Option<usize>,
@@ -131,6 +380,7 @@ impl Response {
             total_s,
             tokens_per_second,
             decode_tokens_per_second,
+            generated_tokens,
             distributed_overhead_s,
             remote_compute_s,
             remote_requests,
@@ -210,6 +460,7 @@ where
             _ => None,
         };
 
+        let dist = snapshot_distributed_profile();
         let response = Response::from_assistant_response(
             G::MODEL_NAME.to_string(),
             resp,
@@ -217,12 +468,11 @@ where
             total_s,
             tokens_per_second,
             decode_tokens_per_second,
-            Some(snapshot_distributed_profile().distributed_overhead_s()),
-            Some(snapshot_distributed_profile().remote_compute_s),
-            Some(snapshot_distributed_profile().remote_requests),
+            generated_tokens,
+            Some(dist.distributed_overhead_s()),
+            Some(dist.remote_compute_s),
+            Some(dist.remote_requests),
         );
-
-        let dist = snapshot_distributed_profile();
 
         // （新增）服务端日志也打印一份，方便不看 JSON 的情况下观察首 token 与总耗时。
         log::info!(
@@ -241,6 +491,24 @@ where
             dist.distributed_overhead_s(),
             dist.remote_compute_s,
             dist.remote_requests
+        );
+        log::info!(
+            "distributed transfer for {}: write_s={:.3} read_s={:.3} write_bytes={} read_bytes={} avg_write_kb={:.2} avg_read_kb={:.2}",
+            &client,
+            dist.remote_write_s,
+            dist.remote_read_s,
+            dist.remote_write_bytes,
+            dist.remote_read_bytes,
+            if dist.remote_requests > 0 {
+                dist.remote_write_bytes as f64 / dist.remote_requests as f64 / 1024.0
+            } else {
+                0.0
+            },
+            if dist.remote_requests > 0 {
+                dist.remote_read_bytes as f64 / dist.remote_requests as f64 / 1024.0
+            } else {
+                0.0
+            }
         );
 
         return HttpResponse::Ok().json(response);
@@ -318,6 +586,7 @@ where
                     total_s: None,
                     tokens_per_second: None,
                     decode_tokens_per_second: None,
+                    generated_tokens: None,
                     distributed_overhead_s: None,
                     remote_compute_s: None,
                     remote_requests: None,
@@ -356,6 +625,7 @@ where
                     }
                     _ => None,
                 };
+                let dist = snapshot_distributed_profile();
                 let final_chunk = StreamResponse {
                     id: id.clone(),
                     object: "chat.completion.chunk".to_string(),
@@ -370,11 +640,11 @@ where
                     total_s: Some(total_s),
                     tokens_per_second,
                     decode_tokens_per_second,
-                    distributed_overhead_s: Some(snapshot_distributed_profile().distributed_overhead_s()),
-                    remote_compute_s: Some(snapshot_distributed_profile().remote_compute_s),
-                    remote_requests: Some(snapshot_distributed_profile().remote_requests),
+                    generated_tokens: Some(generated_tokens),
+                    distributed_overhead_s: Some(dist.distributed_overhead_s()),
+                    remote_compute_s: Some(dist.remote_compute_s),
+                    remote_requests: Some(dist.remote_requests),
                 };
-                let dist = snapshot_distributed_profile();
                 if let Ok(j) = serde_json::to_string(&final_chunk) {
                     send(&tx, &format!("data: {j}\n\n"));
                 }
@@ -396,6 +666,24 @@ where
                     dist.remote_compute_s,
                     dist.remote_requests
                 );
+                log::info!(
+                    "distributed transfer for {}: write_s={:.3} read_s={:.3} write_bytes={} read_bytes={} avg_write_kb={:.2} avg_read_kb={:.2}",
+                    &client_for_task,
+                    dist.remote_write_s,
+                    dist.remote_read_s,
+                    dist.remote_write_bytes,
+                    dist.remote_read_bytes,
+                    if dist.remote_requests > 0 {
+                        dist.remote_write_bytes as f64 / dist.remote_requests as f64 / 1024.0
+                    } else {
+                        0.0
+                    },
+                    if dist.remote_requests > 0 {
+                        dist.remote_read_bytes as f64 / dist.remote_requests as f64 / 1024.0
+                    } else {
+                        0.0
+                    }
+                );
             }
             Err(e) => {
                 log::error!("generation failed for {}: {}", &client_for_task, &e);
@@ -415,6 +703,7 @@ where
         .insert_header(("Content-Type", "text/event-stream"))
         .insert_header(("Cache-Control", "no-cache"))
         .insert_header(("Connection", "keep-alive"))
+        .insert_header(("X-DIAL-Model", G::MODEL_NAME))
         .streaming(body)
 }
 
@@ -422,11 +711,46 @@ async fn not_found() -> actix_web::Result<HttpResponse> {
     Ok(HttpResponse::NotFound().body("nope"))
 }
 
+async fn web_chat() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../web_chat/index.html"
+        )))
+}
+
+async fn web_chat_styles() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/css; charset=utf-8")
+        .body(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../web_chat/styles.css"
+        )))
+}
+
+async fn web_chat_script() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/javascript; charset=utf-8")
+        .body(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../web_chat/app.js"
+        )))
+}
+
 pub(crate) async fn start<G>(master: Master<G>) -> anyhow::Result<()>
 where
     G: Generator + Send + Sync + 'static,
 {
     let address = master.ctx.args.api.as_ref().unwrap().to_string();
+    // Base64 expands video bytes by roughly 4/3. Keep room for JSON, text and history.
+    let json_limit = master
+        .ctx
+        .args
+        .video_max_bytes
+        .saturating_mul(4)
+        .saturating_div(3)
+        .saturating_add(8 * 1024 * 1024);
 
     log::info!("starting api on http://{} ...", &address);
 
@@ -436,7 +760,14 @@ where
         move || {
             App::new()
                 .app_data(web::Data::new(state.clone()))
+                .app_data(web::JsonConfig::default().limit(json_limit))
+                .route("/", web::get().to(web_chat))
+                .route("/chat", web::get().to(web_chat))
+                .route("/web-chat", web::get().to(web_chat))
+                .route("/web-chat/styles.css", web::get().to(web_chat_styles))
+                .route("/web-chat/app.js", web::get().to(web_chat_script))
                 .route("/api/v1/chat/completions", web::post().to(chat::<G>))
+                .route("/api/v1/topology", web::get().to(topology::<G>))
                 .default_service(web::route().to(not_found))
         }, //.wrap(actix_web::middleware::Logger::default()))
     )

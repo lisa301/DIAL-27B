@@ -81,6 +81,8 @@ impl<G: Generator + Send + Sync + 'static> Master<G> {
                 break;
             } else {
                 stream(&token.to_string());
+                // Yield to let HTTP streaming tasks flush chunked responses promptly.
+                tokio::task::yield_now().await;
             }
         }
 

@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod llama3;
+pub mod qwen3_8;
 pub mod qwen3_vl;
 
 use crate::spm::{Context, Forwarder};
@@ -27,7 +28,8 @@ impl std::fmt::Display for Token {
             if let Some(text) = &self.text {
                 text.clone()
             } else {
-                format!("<token {}>", self.id)  /// 无文本时显示token ID
+                // 无文本时显示token ID
+                format!("<token {}>", self.id)
             }
         )
     }

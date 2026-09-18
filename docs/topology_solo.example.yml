@@ -1,0 +1,2 @@
+# Solo baseline: an empty worker map leaves every layer on the Master.
+{}

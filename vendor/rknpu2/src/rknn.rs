@@ -96,6 +96,41 @@ impl<A: RKNNAPI> RKNN<A> {
         feature = "docs",
         doc(cfg(any(feature = "rk35xx", feature = "rk3576")))
     )]
+    pub fn set_input_shapes(
+        &self,
+        attrs: &[crate::query::InputAttr],
+        dims: &[Vec<u32>],
+    ) -> Result<(), Error> {
+        if attrs.len() != dims.len() {
+            return Err(Error::ParamInvalid);
+        }
+        let mut ffi_attrs = Vec::with_capacity(attrs.len());
+        for (attr, d) in attrs.iter().zip(dims.iter()) {
+            if d.len() != attr.inner.n_dims as usize || d.is_empty() || d.len() > attr.inner.dims.len() {
+                return Err(Error::ParamInvalid);
+            }
+            let mut raw = attr.inner;
+            raw.n_dims = d.len() as u32;
+            for (i, v) in d.iter().enumerate() {
+                raw.dims[i] = *v;
+            }
+            ffi_attrs.push(raw);
+        }
+        let ret = unsafe {
+            self.api
+                .set_input_shapes(self.ctx, ffi_attrs.len() as u32, ffi_attrs.as_mut_ptr())?
+        };
+        if ret != 0 {
+            return Err(ret.into());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "rk3576", feature = "rk35xx"))]
+    #[cfg_attr(
+        feature = "docs",
+        doc(cfg(any(feature = "rk35xx", feature = "rk3576")))
+    )]
     pub fn get_outputs<'a>(&self, outputs: &mut [Output<'a>]) -> Result<(), Error> {
         let mut outputs_ffi = outputs
             .iter_mut()
@@ -122,13 +157,34 @@ impl<A: RKNNAPI> RKNN<A> {
         Ok(())
     }
 
+    #[cfg(any(feature = "rk3576", feature = "rk35xx"))]
+    #[cfg_attr(
+        feature = "docs",
+        doc(cfg(any(feature = "rk35xx", feature = "rk3576")))
+    )]
+    pub fn release_outputs<'a>(&self, outputs: &mut [Output<'a>]) -> Result<(), Error> {
+        let mut outputs_ffi = outputs
+            .iter_mut()
+            .map(|t| t.as_sys_output())
+            .collect::<Vec<_>>();
+
+        let ret = unsafe {
+            self.api
+                .outputs_release(self.ctx, outputs_ffi.len() as u32, outputs_ffi.as_mut_ptr())?
+        };
+        if ret != 0 {
+            return Err(ret.into());
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "rk3576")]
     #[cfg_attr(feature = "docs", doc(cfg(feature = "rk3576")))]
     pub fn set_core_mask(&self, mask: NpuCores) -> Result<(), Error> {
-        unsafe {
-            self.api.set_core_mask(self.ctx, mask.into())?;
+        let ret = unsafe { self.api.set_core_mask(self.ctx, mask.into())? };
+        if ret != 0 {
+            return Err(ret.into());
         }
-
         Ok(())
     }
 }

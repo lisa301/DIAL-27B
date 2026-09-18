@@ -1,0 +1,19 @@
+# Static-even baseline for Qwen3-VL-8B (36 transformer layers).
+# The RK3588 Master owns layers 0-8 because layers absent from this file run locally.
+rk-worker1:
+  host: "192.168.1.81:10128"
+  description: "RK3588 worker 1, static-even baseline"
+  layers:
+    - "model.language_model.layers.9-17"
+
+rk-worker2:
+  host: "192.168.1.82:10128"
+  description: "RK3588 worker 2, static-even baseline"
+  layers:
+    - "model.language_model.layers.18-26"
+
+orin-worker:
+  host: "192.168.1.87:10128"
+  description: "Jetson Orin worker, static-even baseline"
+  layers:
+    - "model.language_model.layers.27-35"

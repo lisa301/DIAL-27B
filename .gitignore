@@ -1,5 +1,8 @@
 /target
 /transmodel
+/build
+__pycache__/
+*.py[cod]
 技术文档.md 
 技术文档.pdf
 .DS_Store

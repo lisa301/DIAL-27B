@@ -40,9 +40,15 @@ impl VisionRknn {
         let rknn = RKNN::new_with_library(lib_path, &mut model_data, RknnInitFlags::builder())
             .map_err(|e| anyhow!("rknn init failed: {e}"))?;
 
-        // Prefer all NPU cores (0/1/2). If driver ignores it, it will fall back to default.
-        rknn.set_core_mask(NpuCores::ALL)
-            .map_err(|e| anyhow!("rknn set_core_mask failed: {e}"))?;
+        if let Err(e) = rknn.set_core_mask(NpuCores::cores_0_1_2()) {
+            log::warn!("rknn set_core_mask(0_1_2) failed: {}; fallback to auto", e);
+            if let Err(e2) = rknn.set_core_mask(NpuCores::auto()) {
+                log::warn!(
+                    "rknn set_core_mask(auto) failed: {}; continue with runtime default",
+                    e2
+                );
+            }
+        }
 
         let io_num = rknn
             .query::<InputOutputNum>()
@@ -155,7 +161,8 @@ impl VisionRknn {
             BF16(Vec<bf16>),
         }
 
-        let input_buf = match self.input_attr.dtype() {
+        let input_dtype = self.input_attr.dtype();
+        let input_buf = match input_dtype {
             DataTypeKind::Float32(_) => InputBuffer::F32(input_f32),
             DataTypeKind::Float16(_) => {
                 InputBuffer::F16(input_f32.iter().map(|v| f16::from_f32(*v)).collect())
@@ -163,13 +170,22 @@ impl VisionRknn {
             DataTypeKind::BFloat16(_) => {
                 InputBuffer::BF16(input_f32.iter().map(|v| bf16::from_f32(*v)).collect())
             }
+            DataTypeKind::Int8(_) | DataTypeKind::UInt8(_) => InputBuffer::F32(input_f32),
             other => bail!("unsupported rknn input dtype: {other:?}"),
         };
+        let input_pass_through =
+            !matches!(input_dtype, DataTypeKind::Int8(_) | DataTypeKind::UInt8(_));
 
         let input = match &input_buf {
-            InputBuffer::F32(buf) => Input::new(0, BufView::F32(buf), true, input_fmt),
-            InputBuffer::F16(buf) => Input::new(0, BufView::F16(buf), true, input_fmt),
-            InputBuffer::BF16(buf) => Input::new(0, BufView::BF16(buf), true, input_fmt),
+            InputBuffer::F32(buf) => {
+                Input::new(0, BufView::F32(buf), input_pass_through, input_fmt)
+            }
+            InputBuffer::F16(buf) => {
+                Input::new(0, BufView::F16(buf), input_pass_through, input_fmt)
+            }
+            InputBuffer::BF16(buf) => {
+                Input::new(0, BufView::BF16(buf), input_pass_through, input_fmt)
+            }
         };
 
         self.rknn
@@ -203,11 +219,26 @@ impl VisionRknn {
         for (attr, out) in self.output_attrs.iter().zip(output_bufs) {
             let out_dims: Vec<usize> = attr.dims().iter().map(|d| *d as usize).collect();
             let out = Tensor::from_vec(out, Shape::from_dims(&out_dims), &Device::Cpu)
-                .map_err(|e| anyhow!("vision output tensor failed for output {}: {e}", attr.index()))?
+                .map_err(|e| {
+                    anyhow!(
+                        "vision output tensor failed for output {}: {e}",
+                        attr.index()
+                    )
+                })?
                 .to_dtype(dtype)
-                .map_err(|e| anyhow!("vision output to dtype failed for output {}: {e}", attr.index()))?
+                .map_err(|e| {
+                    anyhow!(
+                        "vision output to dtype failed for output {}: {e}",
+                        attr.index()
+                    )
+                })?
                 .to_device(device)
-                .map_err(|e| anyhow!("vision output to device failed for output {}: {e}", attr.index()))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "vision output to device failed for output {}: {e}",
+                        attr.index()
+                    )
+                })?;
             tensors.push(out);
         }
 

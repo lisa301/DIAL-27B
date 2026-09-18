@@ -2,13 +2,55 @@
 #[macro_use]
 extern crate anyhow;
 
-use spm::Mode;
+use spm::{Mode, PlannerAlgorithm};
 
 use clap::Parser;
 
 pub mod models;
+#[cfg(feature = "master")]
+pub mod qwen3_8_rpc;
 pub mod spm;
 pub mod utils;
+
+/// Selects the inference implementation without changing the existing model paths.
+#[derive(Clone, clap::ValueEnum, Debug, Default, PartialEq, Eq)]
+pub enum InferenceBackend {
+    /// Existing native DIAL Llama3/Qwen3-VL implementation.
+    #[default]
+    Native,
+    /// Qwen3.8 implemented inside DIAL with the existing topology and tensor protocol.
+    #[value(name = "qwen38-native")]
+    Qwen38Native,
+    /// Upstream GGML quantized layers inside DIAL's distributed tensor topology.
+    #[value(name = "qwen38-ggml")]
+    Qwen38Ggml,
+    /// Qwen3.8 through llama.cpp, with a remote CUDA device exposed over GGML RPC.
+    #[value(name = "qwen38-rpc")]
+    Qwen38Rpc,
+}
+
+/// Qwen3.8 quantized linear implementation.
+#[derive(Clone, Copy, clap::ValueEnum, Debug, Default, PartialEq, Eq)]
+pub enum Qwen38QuantLinear {
+    /// Use device-resident CUDA quantized weights on CUDA/F16, otherwise dense fallback.
+    #[default]
+    Auto,
+    /// Force the compatibility path which expands quantized weights to the runtime dtype.
+    Dense,
+    /// Require the device-resident CUDA NVFP4/FP8 implementation.
+    Cuda,
+}
+
+/// User-facing model size selector. The two sizes use different inference backends.
+#[derive(Clone, Copy, clap::ValueEnum, Debug, PartialEq, Eq)]
+pub enum ModelSize {
+    /// Qwen3-VL-8B through DIAL's native distributed backend.
+    #[value(name = "8b")]
+    B8,
+    /// Qwen3.8-27B through DIAL's native distributed backend.
+    #[value(name = "27b")]
+    B27,
+}
 
 #[derive(Clone, Parser, Default, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -18,6 +60,82 @@ pub struct Args {
     pub device: usize,
     #[arg(long, default_value_t, value_enum)]
     pub mode: Mode,
+
+    /// Model size to run: `8b` keeps the existing native path, while `27b`
+    /// selects DIAL's native distributed Qwen3.8 path. The default remains 8B.
+    #[arg(long, value_enum)]
+    pub model_size: Option<ModelSize>,
+
+    /// Inference implementation. `native` preserves the existing Llama/Qwen3-VL
+    /// behavior, `qwen38-native` uses Candle layers, `qwen38-ggml` uses upstream
+    /// GGML layers with DIAL sharding, and `qwen38-rpc` is a llama.cpp API proxy.
+    #[arg(long, value_enum, default_value_t)]
+    pub inference_backend: InferenceBackend,
+
+    /// llama.cpp server executable used by the qwen38-rpc master.
+    #[arg(long, default_value = "llama-server")]
+    pub qwen38_llama_server_bin: String,
+
+    /// llama.cpp RPC executable used by the qwen38-rpc worker.
+    #[arg(long, default_value = "ggml-rpc-server")]
+    pub qwen38_rpc_server_bin: String,
+
+    /// Qwen3.8 GGUF weights for qwen38-ggml or qwen38-rpc.
+    /// If omitted, `--model` is used when it points to a `.gguf` file.
+    #[arg(long)]
+    pub qwen38_gguf: Option<String>,
+
+    /// DIAL GGML adapter shared library, built locally on each Thor/Orin node.
+    /// Required by qwen38-ggml; --model remains the HF config/tokenizer directory.
+    #[arg(long)]
+    pub qwen38_ggml_lib: Option<String>,
+
+    /// Optional Qwen3.8 llama.cpp multimodal projector (`mmproj-*.gguf`).
+    #[arg(long)]
+    pub qwen38_mmproj: Option<String>,
+
+    /// Comma-separated remote GGML RPC endpoints, for example `192.168.2.20:50052`.
+    #[arg(long)]
+    pub qwen38_rpc_workers: Option<String>,
+
+    /// Reuse an already-running llama.cpp server instead of launching one.
+    #[arg(long)]
+    pub qwen38_upstream_url: Option<String>,
+
+    /// Loopback port for the managed llama.cpp server behind the DIAL API proxy.
+    #[arg(long, default_value_t = 18083)]
+    pub qwen38_upstream_port: u16,
+
+    /// Time allowed for a managed llama.cpp server to load the model.
+    #[arg(long, default_value_t = 600)]
+    pub qwen38_startup_timeout_s: u64,
+
+    /// Optional llama.cpp tensor split, such as `1,1` for one local and one RPC GPU.
+    /// Leave unset to distribute according to free memory.
+    #[arg(long)]
+    pub qwen38_tensor_split: Option<String>,
+
+    /// Memory margin in MiB that llama.cpp should retain on every GPU.
+    #[arg(long, default_value_t = 1024)]
+    pub qwen38_fit_target_mib: usize,
+
+    /// Enable the model's thinking mode. Set false for Instruct-style direct answers.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub qwen38_thinking: bool,
+
+    /// Qwen3.8 quantized linear implementation: auto, dense, or cuda.
+    #[arg(long, value_enum, default_value_t)]
+    pub qwen38_quant_linear: Qwen38QuantLinear,
+
+    /// Enable the llama.cpp RPC worker's local tensor cache.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub qwen38_rpc_cache: bool,
+
+    /// Append one raw argument to the managed llama-server command. Repeat for
+    /// option/value pairs, e.g. `--qwen38-llama-arg=--cache-type-k
+    /// --qwen38-llama-arg=q8_0`.
+    #[arg(long, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    pub qwen38_llama_arg: Vec<String>,
 
     /// Worker name.
     #[arg(long, default_value = "worker0")]
@@ -82,20 +200,21 @@ pub struct Args {
     /// - 输出尺寸会对齐到 `patch_size * spatial_merge_size` 的整数倍，避免后续 encode() 再 crop。
     /// - 默认会保持宽高比并做 letterbox（用 0.5 灰填充，归一化后约为 0），不会裁剪内容。
     /// - 与 `--vision-max-side` 不同：它是“强制固定”，适合导出 ONNX/bmodel。
-    #[arg(long)]
+    #[arg(long, default_value = "448")]
     pub vision_fixed_side: Option<u32>,
 
-    /// （新增）使用 RKNN 运行视觉编码器（ViT+merger），指定 .rknn 模型路径。
+    ///   使用 RKNN 运行视觉编码器（ViT+merger），指定 .rknn 模型路径。
     #[arg(long)]
     pub vision_rknn: Option<String>,
 
-    /// （新增）RKNN runtime 库路径（librknnrt.so），不填则自动搜索。
+    /// RKNN runtime 库路径（librknnrt.so），不填则自动搜索。
     #[arg(long)]
     pub vision_rknn_lib: Option<String>,
 
-    /// （新增）使用 RKNN chunk 运行 Qwen3-VL 文本 decode（目录下应包含按层切块的 .rknn）。
+    ///   使用 RKNN chunk 运行 Qwen3-VL 文本路径（目录下应包含按层切块的 .rknn）。
     ///
-    /// 目前仅接管 decode（seq=1, index_pos>0）路径，prefill 仍走现有 candle/分布式 forward。
+    /// - decode：加载 `text_decode` chunk（必需）。
+    /// - prefill：默认不使用；需显式开启 `--text-rknn-prefill`。
     #[arg(long)]
     pub text_rknn_dir: Option<String>,
 
@@ -103,18 +222,105 @@ pub struct Args {
     #[arg(long)]
     pub text_rknn_lib: Option<String>,
 
+    /// 使用 RKNN 运行本地文本注意力中的无状态 QKV 投影子图。
+    ///
+    /// 这条路径不接管 KV cache，不接管 attention softmax，只替换 `q_proj/k_proj/v_proj`
+    /// 三个线性层，适合作为比完整 text_rknn chunk 更稳定的 NPU+CPU 拆分方案。
+    #[arg(long)]
+    pub text_qkv_rknn_dir: Option<String>,
+
+    /// 文本 QKV RKNN 子图的 runtime 库路径（librknnrt.so），不填则自动搜索。
+    #[arg(long)]
+    pub text_qkv_rknn_lib: Option<String>,
+
+    /// 使用 RKNN 运行本地文本 MLP 子图（gate/up + SiLU + down）。
+    ///
+    /// 这条路径只接管 decode 阶段 shape=[1,1,hidden] 的 MLP，attention/KV cache 仍由宿主运行。
+    #[arg(long)]
+    pub text_mlp_rknn_dir: Option<String>,
+
+    /// 文本 MLP RKNN 子图的 runtime 库路径（librknnrt.so），不填则自动搜索。
+    #[arg(long)]
+    pub text_mlp_rknn_lib: Option<String>,
+
+    /// 显式启用 text RKNN prefill。
+    ///
+    /// 适合 RK3588 这类 NPU+CPU 部署：prefill 走完整的 RKNN 文本 chunk，decode 再按
+    /// `--text-decode-mode` 选择 NPU 前缀或纯 CPU 软件尾部。默认关闭，避免在 prefill
+    /// chunk 未准备完整时污染 KV/hidden。
+    #[arg(long, default_value_t = false)]
+    pub text_rknn_prefill: bool,
+
+    /// （新增）文本 decode 执行模式（仅影响 decode 阶段）：
+    /// - auto：有 text_rknn 则自动使用（全覆盖=全NPU，前缀覆盖=NPU+CPU），无则纯软件路径。
+    /// - full-npu：decode 必须全层走 RKNN（需要完整 decode chunk 覆盖）。
+    /// - npu-cpu：decode 先走 RKNN 前缀层，再走本地/分布式剩余层；保留 `npu-gpu` 旧别名。
+    /// - cpu-only：decode 强制不走 RKNN，全部走本地/分布式层；保留 `cpu-gpu` 旧别名。
+    #[arg(long, default_value = "auto")]
+    pub text_decode_mode: String,
+
     /// （新增）配合 `--api-client`：附带本地图片文件，用于 Qwen3-VL 这类多模态模型的图片理解。
     /// 实现方式：客户端会把图片转成 base64，并按 OpenAI 风格的 `image_base64` part 发送。
     #[arg(long)]
     pub image: Option<String>,
 
+    /// 配合 `--api-client`：附带本地视频文件。服务端默认按 Qwen3-VL 官方规则采样。
+    #[arg(long)]
+    pub video: Option<String>,
+
+    /// 单个原始视频请求允许的最大二进制大小。超限会明确拒绝，不会截断视频。
+    #[arg(long, default_value_t = 268_435_456)]
+    pub video_max_bytes: usize,
+
+    /// 官方视频采样后的最大帧数（默认 768）。
+    #[arg(long, default_value_t = 768)]
+    pub video_max_frames: usize,
+
+    /// 官方视频采样帧率（默认 2 FPS）。设置为 0 时按最大帧数均匀采样。
+    #[arg(long, default_value_t = 2.0)]
+    pub video_fps: f64,
+
+    /// 视频采样的最小帧数（默认 4）。
+    #[arg(long, default_value_t = 4)]
+    pub video_min_frames: usize,
+
+    /// 显式关闭官方采样，处理全部原始帧；长视频会非常慢。
+    #[arg(long, default_value_t = false)]
+    pub video_no_sample: bool,
+
+    /// 视觉时间 patch 的批大小。增大可提升吞吐，但会增加内存占用。
+    #[arg(long, default_value_t = 4)]
+    pub video_batch_size: usize,
+
+    /// 视频采样帧送入视觉编码器前的最大边长。仅缩放空间尺寸，不减少时间帧。
+    #[arg(long, default_value_t = 128)]
+    pub video_max_side: u32,
+
     /// Llama3 model data path.
-    #[arg(long, default_value = "/root/sdb/Qwen3-VL-8B-Instruct")]
+    #[arg(
+        long,
+        default_value = "/home/seaway/sdb/ljl/model/Qwen3-VL-8B-Instruct"
+    )]
     pub model: String,
 
     /// Topology file.
-    #[arg(long, default_value = "/root/sdb/ljl/Spm_llama/topology.yml")]
+    #[arg(
+        long,
+        default_value = "/home/seaway/sdb/ljl/Dial_llama/topology_qwen3vl.yml"
+    )]
     pub topology: String,
+
+    /// Replace the static topology with a profile-guided automatic plan.
+    #[arg(long)]
+    pub auto_plan_profile: Option<String>,
+
+    /// Planning objective used with --auto-plan-profile.
+    #[arg(long, value_enum, default_value_t = PlannerAlgorithm::Dial)]
+    pub auto_plan_algorithm: PlannerAlgorithm,
+
+    /// Write the selected automatic plan and cost breakdown as JSON (master only).
+    #[arg(long)]
+    pub auto_plan_output: Option<String>,
 
     /// The initial prompt.
     #[arg(long, default_value = "")]
@@ -149,7 +355,211 @@ pub struct Args {
     /// Force attention matmul/softmax to use f32 (more stable, slower).
     #[arg(long, default_value_t = false)]
     pub attn_f32: bool,
+    /// Run the Qwen3-VL lm_head through the CPU q8 implementation.
+    /// Enabled by default for the RK3588 master; pass `true` or `false` for A/B tests.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub lm_head_q8: bool,
+    /// Enable q8 quantization for local Qwen3-VL transformer linear layers. Use `--local-linear-q8 false` to disable.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub local_linear_q8: bool,
+    /// Quantize Qwen3-VL transformer linear weights to row-wise int8 on CUDA workers.
+    /// Activations, outputs, KV cache, and network tensors remain F16.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub worker_w8a16: bool,
+    /// Use Ollama/llama.cpp GGUF quantized transformer weights on CUDA workers.
+    /// Only transformer layers assigned to this worker are loaded from the file.
+    #[arg(long)]
+    pub worker_quantized_gguf: Option<String>,
+    /// Use fused FP16 projections for GGUF prefill while retaining GGUF for decode.
+    /// This dequantizes a second, resident copy of the assigned projection weights.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub worker_gguf_fp16_prefill: bool,
+    /// Run final RMSNorm and the quantized GGUF output projection on the Worker
+    /// that owns the final transformer layer, returning F16 logits to the Master.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub worker_gguf_output_head: bool,
+    /// Sample on the GGUF output-head Worker and return only one U32 token id.
+    /// Requires --worker-gguf-output-head and removes full-vocabulary logits transfers.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub worker_gguf_sample_token: bool,
     /// Run on CPU rather than on GPU.
     #[arg(long)]
     pub cpu: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_plan_algorithm_names_match_experiment_reports() {
+        let latency = Args::try_parse_from([
+            "dial-core",
+            "--auto-plan-profile",
+            "profile.yml",
+            "--auto-plan-algorithm",
+            "edgeshard-latency",
+        ])
+        .unwrap();
+        assert_eq!(
+            latency.auto_plan_algorithm,
+            PlannerAlgorithm::EdgeShardLatency
+        );
+        assert_eq!(
+            serde_json::to_value(latency.auto_plan_algorithm).unwrap(),
+            serde_json::json!("edgeshard-latency")
+        );
+
+        let throughput = Args::try_parse_from([
+            "dial-core",
+            "--auto-plan-profile",
+            "profile.yml",
+            "--auto-plan-algorithm",
+            "edgeshard-throughput",
+        ])
+        .unwrap();
+        assert_eq!(
+            throughput.auto_plan_algorithm,
+            PlannerAlgorithm::EdgeShardThroughput
+        );
+        assert_eq!(
+            serde_json::to_value(throughput.auto_plan_algorithm).unwrap(),
+            serde_json::json!("edgeshard-throughput")
+        );
+    }
+
+    #[test]
+    fn lm_head_q8_is_boolean_and_enabled_by_default() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert!(default_args.lm_head_q8);
+
+        let q8_args = Args::try_parse_from(["dial-core", "--lm-head-q8", "true"]).unwrap();
+        assert!(q8_args.lm_head_q8);
+
+        let f16_args = Args::try_parse_from(["dial-core", "--lm-head-q8", "false"]).unwrap();
+        assert!(!f16_args.lm_head_q8);
+    }
+
+    #[test]
+    fn worker_w8a16_is_boolean_and_disabled_by_default() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert!(!default_args.worker_w8a16);
+
+        let enabled = Args::try_parse_from(["dial-core", "--worker-w8a16", "true"]).unwrap();
+        assert!(enabled.worker_w8a16);
+
+        let disabled = Args::try_parse_from(["dial-core", "--worker-w8a16", "false"]).unwrap();
+        assert!(!disabled.worker_w8a16);
+    }
+
+    #[test]
+    fn qwen38_rpc_backend_is_explicit_and_native_remains_default() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert_eq!(default_args.inference_backend, InferenceBackend::Native);
+        assert_eq!(default_args.model_size, None);
+
+        let qwen38 = Args::try_parse_from([
+            "dial-core",
+            "--inference-backend",
+            "qwen38-rpc",
+            "--qwen38-gguf",
+            "/models/qwen38.gguf",
+            "--qwen38-rpc-workers",
+            "192.168.2.21:50052",
+            "--qwen38-thinking",
+            "false",
+        ])
+        .unwrap();
+        assert_eq!(qwen38.inference_backend, InferenceBackend::Qwen38Rpc);
+        assert_eq!(qwen38.qwen38_gguf.as_deref(), Some("/models/qwen38.gguf"));
+        assert!(!qwen38.qwen38_thinking);
+    }
+
+    #[test]
+    fn qwen38_ggml_backend_and_adapter_parse() {
+        let args = Args::try_parse_from(["dial-core", "--inference-backend", "qwen38-ggml",
+            "--qwen38-gguf", "/models/model.gguf", "--qwen38-ggml-lib", "/lib/adapter.so"]).unwrap();
+        assert_eq!(args.inference_backend, InferenceBackend::Qwen38Ggml);
+        assert_eq!(args.qwen38_ggml_lib.as_deref(), Some("/lib/adapter.so"));
+    }
+
+    #[test]
+    fn qwen38_quant_linear_modes_parse_and_auto_is_default() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert_eq!(default_args.qwen38_quant_linear, Qwen38QuantLinear::Auto);
+
+        let cuda = Args::try_parse_from(["dial-core", "--qwen38-quant-linear", "cuda"]).unwrap();
+        assert_eq!(cuda.qwen38_quant_linear, Qwen38QuantLinear::Cuda);
+
+        let dense = Args::try_parse_from(["dial-core", "--qwen38-quant-linear", "dense"]).unwrap();
+        assert_eq!(dense.qwen38_quant_linear, Qwen38QuantLinear::Dense);
+    }
+
+    #[test]
+    fn model_size_accepts_8b_and_27b() {
+        let eight = Args::try_parse_from(["dial-core", "--model-size", "8b"]).unwrap();
+        assert_eq!(eight.model_size, Some(ModelSize::B8));
+
+        let twenty_seven = Args::try_parse_from(["dial-core", "--model-size", "27b"]).unwrap();
+        assert_eq!(twenty_seven.model_size, Some(ModelSize::B27));
+    }
+
+    #[test]
+    fn worker_gguf_fp16_prefill_is_boolean_and_disabled_by_default() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert!(!default_args.worker_gguf_fp16_prefill);
+
+        let enabled =
+            Args::try_parse_from(["dial-core", "--worker-gguf-fp16-prefill", "true"]).unwrap();
+        assert!(enabled.worker_gguf_fp16_prefill);
+
+        let disabled =
+            Args::try_parse_from(["dial-core", "--worker-gguf-fp16-prefill", "false"]).unwrap();
+        assert!(!disabled.worker_gguf_fp16_prefill);
+    }
+
+    #[test]
+    fn worker_gguf_output_head_is_boolean_and_disabled_by_default() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert!(!default_args.worker_gguf_output_head);
+
+        let enabled =
+            Args::try_parse_from(["dial-core", "--worker-gguf-output-head", "true"]).unwrap();
+        assert!(enabled.worker_gguf_output_head);
+
+        let disabled =
+            Args::try_parse_from(["dial-core", "--worker-gguf-output-head", "false"]).unwrap();
+        assert!(!disabled.worker_gguf_output_head);
+    }
+
+    #[test]
+    fn worker_gguf_sample_token_is_boolean_and_disabled_by_default() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert!(!default_args.worker_gguf_sample_token);
+
+        let enabled =
+            Args::try_parse_from(["dial-core", "--worker-gguf-sample-token", "true"]).unwrap();
+        assert!(enabled.worker_gguf_sample_token);
+
+        let disabled =
+            Args::try_parse_from(["dial-core", "--worker-gguf-sample-token", "false"]).unwrap();
+        assert!(!disabled.worker_gguf_sample_token);
+    }
+
+    #[test]
+    fn worker_quantized_gguf_accepts_a_path() {
+        let default_args = Args::try_parse_from(["dial-core"]).unwrap();
+        assert!(default_args.worker_quantized_gguf.is_none());
+
+        let args = Args::try_parse_from([
+            "dial-core",
+            "--worker-quantized-gguf",
+            "/models/qwen3-vl-q4_k_m.gguf",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.worker_quantized_gguf.as_deref(),
+            Some("/models/qwen3-vl-q4_k_m.gguf")
+        );
+    }
 }

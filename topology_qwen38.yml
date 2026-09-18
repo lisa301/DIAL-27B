@@ -1,0 +1,5 @@
+worker0:
+  host: "192.168.2.88:10128"
+  description: "Qwen3.8-27B native DIAL shard on the second NVIDIA node"
+  layers:
+    - "model.language_model.layers.0-15"

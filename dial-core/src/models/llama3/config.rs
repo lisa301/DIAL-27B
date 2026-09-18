@@ -57,6 +57,8 @@ impl LlamaConfig {
             eos_token_id: self.eos_token_id,
             max_seq_len: DEFAULT_MAX_SEQ_LEN,
             attn_f32: false,
+            qwen3_8: None,
+            qwen3_8_ggml: None,
         }
     }
 }
@@ -76,4 +78,8 @@ pub struct Config {
     pub eos_token_id: Option<u32>,
     pub max_seq_len: usize,
     pub attn_f32: bool,
+    /// Qwen3.8-specific hybrid-attention configuration. Other model paths leave this unset.
+    pub qwen3_8: Option<std::sync::Arc<crate::models::qwen3_8::TextConfig>>,
+    /// Local GGML engine, never serialized over DIAL's wire.
+    pub qwen3_8_ggml: Option<std::sync::Arc<crate::models::qwen3_8::ggml::GgmlEngine>>,
 }

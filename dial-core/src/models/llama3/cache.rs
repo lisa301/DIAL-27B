@@ -13,9 +13,22 @@ pub struct Cache {
     masks: HashMap<usize, Tensor>,
     use_kv_cache: bool,
     kvs: Vec<Option<(Tensor, Tensor)>>,
+    linear_states: Vec<Option<LinearAttentionState>>,
+    /// Per-connection GGML allocations. `as_new`/`clear` discard them; a
+    /// sequential GGML request may reuse them, resetting contents at position 0.
+    pub(crate) ggml_states: HashMap<usize, std::sync::Arc<crate::models::qwen3_8::ggml::GgmlState>>,
+    pub(crate) ggml_ranges:
+        HashMap<(usize, usize), std::sync::Arc<crate::models::qwen3_8::ggml::GgmlRange>>,
 
     device: Device,
     max_seq_len: usize,
+}
+
+/// Per-layer recurrent state used by Qwen3.8 Gated DeltaNet blocks.
+#[derive(Debug, Clone)]
+pub struct LinearAttentionState {
+    pub conv: Tensor,
+    pub recurrent: Tensor,
 }
 
 impl Cache {
@@ -24,7 +37,11 @@ impl Cache {
     pub fn new(use_kv_cache: bool, dtype: DType, config: &Config, device: &Device) -> Result<Self> {
         let max_seq_len = config.max_seq_len;
         // precompute freqs_cis
-        let n_elem = config.hidden_size / config.num_attention_heads;
+        let n_elem = config
+            .qwen3_8
+            .as_ref()
+            .map(|cfg| cfg.rotary_dim())
+            .unwrap_or(config.hidden_size / config.num_attention_heads);
 
         log::debug!("cache::n_elem = {n_elem}");
 
@@ -56,6 +73,9 @@ impl Cache {
             masks: HashMap::new(),
             use_kv_cache,
             kvs: vec![None; config.num_hidden_layers],
+            linear_states: vec![None; config.num_hidden_layers],
+            ggml_states: HashMap::new(),
+            ggml_ranges: HashMap::new(),
             device: device.clone(),
             cos,
             sin,
@@ -139,6 +159,83 @@ impl Cache {
         Ok((k, v))
     }
 
+    /// Decode fast path: update an existing preallocated KV cache in-place.
+    ///
+    /// The generic `process_kv` path grows cache with `cat + contiguous` on every decode token,
+    /// which repeatedly copies the whole historical KV tensor. During single-token decode we
+    /// preallocate up to `max_seq_len`, write the new token with `slice_set`, and return a
+    /// narrowed view for attention. `slice_set` is backed by a device copy on both CPU and
+    /// CUDA, so the same allocation-free decode path is used on the Orin worker.
+    pub fn process_kv_decode_in_place(
+        &mut self,
+        block_idx: usize,
+        index_pos: usize,
+        k: Tensor,
+        v: Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        if !self.use_kv_cache || index_pos == 0 || index_pos >= self.max_seq_len {
+            return self.process_kv(block_idx, index_pos, k, v);
+        }
+
+        let dims = k.dims();
+        if dims.len() != 4 || dims[2] != 1 {
+            return self.process_kv(block_idx, index_pos, k, v);
+        }
+        let [b_sz, kv_heads, _, head_dim]: [usize; 4] = dims.try_into().map_err(|_| {
+            candle_core::Error::Msg(format!("unexpected kv rank for decode cache: {dims:?}"))
+        })?;
+        let dst_pos = index_pos.min(self.max_seq_len.saturating_sub(1));
+        let active_len = index_pos.saturating_add(1).min(self.max_seq_len);
+
+        let needs_alloc = match &self.kvs[block_idx] {
+            Some((cache_k, cache_v)) => {
+                cache_k.dims() != [b_sz, kv_heads, self.max_seq_len, head_dim]
+                    || cache_v.dims() != [b_sz, kv_heads, self.max_seq_len, head_dim]
+                    || !cache_k.is_contiguous()
+                    || !cache_v.is_contiguous()
+                    || cache_k.dtype() != k.dtype()
+                    || cache_v.dtype() != v.dtype()
+            }
+            None => true,
+        };
+
+        if needs_alloc {
+            let cache_k = Tensor::zeros(
+                (b_sz, kv_heads, self.max_seq_len, head_dim),
+                k.dtype(),
+                k.device(),
+            )?;
+            let cache_v = Tensor::zeros(
+                (b_sz, kv_heads, self.max_seq_len, head_dim),
+                v.dtype(),
+                v.device(),
+            )?;
+            if index_pos > 0 {
+                if let Some((old_k, old_v)) = self.kvs[block_idx].take() {
+                    let old_len = old_k.dims()[2].min(dst_pos);
+                    if old_len > 0 {
+                        cache_k.slice_set(&old_k.narrow(2, 0, old_len)?.contiguous()?, 2, 0)?;
+                        cache_v.slice_set(&old_v.narrow(2, 0, old_len)?.contiguous()?, 2, 0)?;
+                    }
+                }
+            }
+            self.kvs[block_idx] = Some((cache_k, cache_v));
+        }
+
+        let (cache_k, cache_v) = self.kvs[block_idx]
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("missing preallocated kv cache".into()))?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        cache_k.slice_set(&k, 2, dst_pos)?;
+        cache_v.slice_set(&v, 2, dst_pos)?;
+
+        let start = index_pos.saturating_add(1).saturating_sub(self.max_seq_len);
+        let out_k = cache_k.narrow(2, start, active_len)?;
+        let out_v = cache_v.narrow(2, start, active_len)?;
+        Ok((out_k, out_v))
+    }
+
     /// Return a copy of this cache with the same state but new kv table.
     pub fn as_new(&self) -> Self {
         let mut copy = self.clone();
@@ -148,8 +245,48 @@ impl Cache {
 
     /// Clear the cache.
     pub fn clear(&mut self) {
+        self.clear_native_state();
+        self.ggml_ranges.clear();
+        self.ggml_states.clear();
+    }
+
+    /// Start a sequential GGML request without freeing device state, graph
+    /// allocators or warmed CUDA graphs. Its FIRST forward must use position 0:
+    /// the adapter then zeros each participating layer's KV/recurrent state.
+    /// Never use this to create a new connection; `as_new` remains independent.
+    pub(crate) fn reuse_ggml_for_new_request(&mut self) {
+        self.clear_native_state();
+    }
+
+    fn clear_native_state(&mut self) {
         self.masks.clear();
         self.kvs = vec![None; self.kvs.len()];
+        self.linear_states = vec![None; self.linear_states.len()];
+    }
+
+    pub fn linear_state(&self, block_idx: usize) -> Option<LinearAttentionState> {
+        self.linear_states.get(block_idx).and_then(Clone::clone)
+    }
+
+    pub fn set_linear_state(
+        &mut self,
+        block_idx: usize,
+        conv: Tensor,
+        recurrent: Tensor,
+    ) -> Result<()> {
+        let len = self.linear_states.len();
+        let Some(slot) = self.linear_states.get_mut(block_idx) else {
+            candle_core::bail!(
+                "linear-attention cache layer index out of range: {} >= {}",
+                block_idx,
+                len
+            );
+        };
+        *slot = Some(LinearAttentionState {
+            conv: conv.detach(),
+            recurrent: recurrent.detach(),
+        });
+        Ok(())
     }
 
     /// Clone KV tensors for a given layer if present.
@@ -157,6 +294,31 @@ impl Cache {
         self.kvs
             .get(block_idx)
             .and_then(|entry| entry.as_ref().map(|(k, v)| (k.clone(), v.clone())))
+    }
+
+    /// Overwrite KV tensors for a given layer.
+    pub fn set_kv(&mut self, block_idx: usize, mut k: Tensor, mut v: Tensor) -> Result<()> {
+        if block_idx >= self.kvs.len() {
+            candle_core::bail!(
+                "cache layer index out of range: {} >= {}",
+                block_idx,
+                self.kvs.len()
+            );
+        }
+        let k_seq_len = k.dims()[2];
+        if k_seq_len > self.max_seq_len {
+            k = k
+                .narrow(2, k_seq_len - self.max_seq_len, self.max_seq_len)?
+                .contiguous()?;
+        }
+        let v_seq_len = v.dims()[2];
+        if v_seq_len > self.max_seq_len {
+            v = v
+                .narrow(2, v_seq_len - self.max_seq_len, self.max_seq_len)?
+                .contiguous()?;
+        }
+        self.kvs[block_idx] = Some((k, v));
+        Ok(())
     }
 }
 
@@ -178,6 +340,9 @@ mod tests {
             bos_token_id: None,
             eos_token_id: None,
             max_seq_len,
+            attn_f32: false,
+            qwen3_8: None,
+            qwen3_8_ggml: None,
         }
     }
 
@@ -203,5 +368,55 @@ mod tests {
         assert_eq!(k.dims()[2], 7);
 
         Ok(())
+    }
+
+    fn assert_decode_cache_is_preallocated(device: &Device) -> Result<()> {
+        let cfg = test_config(1, 8);
+        let mut cache = Cache::new(true, DType::F32, &cfg, device)?;
+
+        // Prefill creates the normal short cache. The first decode call must migrate it once
+        // into fixed-capacity device storage; subsequent tokens only update one position.
+        let prefill_k = Tensor::from_vec(
+            (0..16).map(|v| v as f32).collect::<Vec<_>>(),
+            (1, 1, 2, 8),
+            device,
+        )?;
+        let prefill_v = (&prefill_k + 100f64)?;
+        cache.process_kv(0, 0, prefill_k, prefill_v)?;
+
+        for index_pos in 2..5 {
+            let token_k = Tensor::full(index_pos as f32, (1, 1, 1, 8), device)?;
+            let token_v = Tensor::full((index_pos + 100) as f32, (1, 1, 1, 8), device)?;
+            let (active_k, active_v) =
+                cache.process_kv_decode_in_place(0, index_pos, token_k, token_v)?;
+
+            assert_eq!(active_k.dims(), [1, 1, index_pos + 1, 8]);
+            assert_eq!(active_v.dims(), [1, 1, index_pos + 1, 8]);
+            let (storage_k, storage_v) = cache.kvs[0].as_ref().unwrap();
+            assert_eq!(storage_k.dims(), [1, 1, cfg.max_seq_len, 8]);
+            assert_eq!(storage_v.dims(), [1, 1, cfg.max_seq_len, 8]);
+        }
+
+        let (active_k, active_v) = cache.process_kv_decode_in_place(
+            0,
+            5,
+            Tensor::full(5f32, (1, 1, 1, 8), device)?,
+            Tensor::full(105f32, (1, 1, 1, 8), device)?,
+        )?;
+        assert_eq!(active_k.flatten_all()?.to_vec1::<f32>()?[16], 2f32);
+        assert_eq!(active_k.flatten_all()?.to_vec1::<f32>()?[40], 5f32);
+        assert_eq!(active_v.flatten_all()?.to_vec1::<f32>()?[40], 105f32);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_cache_is_preallocated_on_cpu() -> Result<()> {
+        assert_decode_cache_is_preallocated(&Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn decode_cache_is_preallocated_on_cuda() -> Result<()> {
+        assert_decode_cache_is_preallocated(&Device::new_cuda(0)?)
     }
 }

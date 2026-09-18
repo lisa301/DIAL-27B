@@ -32,39 +32,61 @@ pub struct Qwen3VlConfig {
 #[derive(Debug, Clone, Deserialize)]
 /// 定义公共结构体 TextConfig
 pub struct TextConfig {
-    pub hidden_size: usize,   /// 隐藏层
-    pub intermediate_size: usize,  /// 中间层
-    pub vocab_size: usize,   /// 词表大小
-    pub num_hidden_layers: usize,  /// 隐藏层数量
-    pub num_attention_heads: usize,  /// 注意力头数
-    pub num_key_value_heads: usize,  /// 键值头数
-    pub rms_norm_eps: f64,   /// RMS归一化
+    pub hidden_size: usize,
+    /// 隐藏层
+    pub intermediate_size: usize,
+    /// 中间层
+    pub vocab_size: usize,
+    /// 词表大小
+    pub num_hidden_layers: usize,
+    /// 隐藏层数量
+    pub num_attention_heads: usize,
+    /// 注意力头数
+    pub num_key_value_heads: usize,
+    /// 键值头数
+    pub rms_norm_eps: f64,
+    /// RMS归一化
     #[serde(default = "default_rope_theta")]
-    pub rope_theta: f32,     /// rope参数
-    pub bos_token_id: Option<u32>,    /// 开始token的ID
-    pub eos_token_id: Option<u32>,    /// 结束token的ID
-    pub max_position_embeddings: usize,     /// 最大位置嵌入
+    pub rope_theta: f32,
+    /// rope参数
+    pub bos_token_id: Option<u32>,
+    /// 开始token的ID
+    pub eos_token_id: Option<u32>,
+    /// 结束token的ID
+    pub max_position_embeddings: usize,
+    /// 最大位置嵌入
 
     /// Some checkpoints omit `lm_head.weight` and tie output projection to embeddings.
     #[serde(default)]
-    pub tie_word_embeddings: bool,   /// 是否将词嵌入与输出投影绑定
+    pub tie_word_embeddings: bool,
+    // 是否将词嵌入与输出投影绑定
 }
 
 #[derive(Debug, Clone, Deserialize)]
 /// 定义公共结构体 VisionConfig
 pub struct VisionConfig {
-    pub depth: usize,    /// 深度
-    pub hidden_size: usize,   /// 隐藏层
-    pub intermediate_size: usize,  /// 中间层
-    pub num_heads: usize,    /// 注意力头数
-    pub in_channels: usize,     /// 输入通道数
-    pub patch_size: usize,      /// 空间patch大小
-    pub temporal_patch_size: usize,     /// 时间patch大小
-    pub num_position_embeddings: usize,     /// 位置编码数量
-    pub spatial_merge_size: usize,     /// 空间融合尺寸
-    pub out_hidden_size: usize,     /// 输出隐藏层
-
-    pub deepstack_visual_indexes: Option<Vec<usize>>,     /// DeepStack视觉层索引
+    pub depth: usize,
+    /// 深度
+    pub hidden_size: usize,
+    /// 隐藏层
+    pub intermediate_size: usize,
+    /// 中间层
+    pub num_heads: usize,
+    /// 注意力头数
+    pub in_channels: usize,
+    /// 输入通道数
+    pub patch_size: usize,
+    /// 空间patch大小
+    pub temporal_patch_size: usize,
+    /// 时间patch大小
+    pub num_position_embeddings: usize,
+    /// 位置编码数量
+    pub spatial_merge_size: usize,
+    /// 空间融合尺寸
+    pub out_hidden_size: usize,
+    /// 输出隐藏层
+    pub deepstack_visual_indexes: Option<Vec<usize>>,
+    // DeepStack视觉层索引
 }
 ///  为 Qwen3VlConfig 结构体实现方法
 impl Qwen3VlConfig {
@@ -93,6 +115,8 @@ impl Qwen3VlConfig {
             eos_token_id: self.text_config.eos_token_id,
             max_seq_len: self.text_config.max_position_embeddings,
             attn_f32: false,
+            qwen3_8: None,
+            qwen3_8_ggml: None,
         }
     }
 }

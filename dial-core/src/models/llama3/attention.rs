@@ -110,11 +110,7 @@ impl CausalSelfAttention {
 
         let y = {
             let in_dtype = q.dtype();
-            let compute_dtype = if self.attn_f32 {
-                DType::F32
-            } else {
-                in_dtype
-            };
+            let compute_dtype = if self.attn_f32 { DType::F32 } else { in_dtype };
             let q = if compute_dtype == in_dtype {
                 q
             } else {
