@@ -116,6 +116,20 @@ where
             .is_some_and(|value| value.starts_with("--qwen38-"))
     });
     let backend_was_set = has_option(&raw_args, "--inference-backend");
+    let gguf_was_set = has_option(&raw_args, "--qwen38-gguf");
+    let ggml_lib_was_set = has_option(&raw_args, "--qwen38-ggml-lib");
+
+    if backend_was_set
+        && matches!(
+            args.inference_backend,
+            InferenceBackend::Native | InferenceBackend::Qwen38Native
+        )
+        && (gguf_was_set || ggml_lib_was_set)
+    {
+        return Err(anyhow!(
+            "--qwen38-gguf/--qwen38-ggml-lib cannot be used with the native backend; use --inference-backend qwen38-ggml"
+        ));
+    }
 
     match args.model_size {
         Some(ModelSize::B8) => {
@@ -133,7 +147,20 @@ where
                 ));
             }
             if !backend_was_set {
-                args.inference_backend = InferenceBackend::Qwen38Native;
+                args.inference_backend = match (gguf_was_set, ggml_lib_was_set) {
+                    (true, true) => InferenceBackend::Qwen38Ggml,
+                    (true, false) => {
+                        return Err(anyhow!(
+                            "--qwen38-gguf requires --qwen38-ggml-lib when --inference-backend is omitted"
+                        ));
+                    }
+                    (false, true) => {
+                        return Err(anyhow!(
+                            "--qwen38-ggml-lib requires --qwen38-gguf when --inference-backend is omitted"
+                        ));
+                    }
+                    (false, false) => InferenceBackend::Qwen38Native,
+                };
             }
         }
         None if args.inference_backend == InferenceBackend::Native && qwen38_option_was_set => {
@@ -1016,6 +1043,15 @@ async fn main() -> Result<()> {
         .format_target(false)
         .init();
 
+    log::info!("selected inference backend: {:?}", args.inference_backend);
+    if args.inference_backend == InferenceBackend::Qwen38Ggml {
+        log::info!(
+            "Qwen3.8 GGML inputs: gguf={} adapter={}",
+            args.qwen38_gguf.as_deref().unwrap_or("missing"),
+            args.qwen38_ggml_lib.as_deref().unwrap_or("missing")
+        );
+    }
+
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     apply_cpu_affinity();
 
@@ -1110,6 +1146,55 @@ mod tests {
         let mut args = Args::try_parse_from(raw).unwrap();
         select_model_size(&mut args, raw).unwrap();
         assert_eq!(args.inference_backend, InferenceBackend::Qwen38Ggml);
+    }
+
+    #[test]
+    fn model_size_27b_with_gguf_selects_ggml_backend() {
+        let raw = [
+            "dial-cli",
+            "--model-size",
+            "27b",
+            "--qwen38-gguf",
+            "/model/q4.gguf",
+            "--qwen38-ggml-lib",
+            "/lib/libdial_qwen38_ggml.so",
+        ];
+        let mut args = Args::try_parse_from(raw).unwrap();
+
+        select_model_size(&mut args, raw).unwrap();
+        assert_eq!(args.inference_backend, InferenceBackend::Qwen38Ggml);
+    }
+
+    #[test]
+    fn model_size_27b_rejects_incomplete_ggml_selection() {
+        let raw = [
+            "dial-cli",
+            "--model-size",
+            "27b",
+            "--qwen38-gguf",
+            "/model/q4.gguf",
+        ];
+        let mut args = Args::try_parse_from(raw).unwrap();
+
+        let error = select_model_size(&mut args, raw).unwrap_err();
+        assert!(error.to_string().contains("--qwen38-ggml-lib"));
+    }
+
+    #[test]
+    fn native_backend_rejects_ignored_gguf() {
+        let raw = [
+            "dial-cli",
+            "--model-size",
+            "27b",
+            "--inference-backend",
+            "qwen38-native",
+            "--qwen38-gguf",
+            "/model/q4.gguf",
+        ];
+        let mut args = Args::try_parse_from(raw).unwrap();
+
+        let error = select_model_size(&mut args, raw).unwrap_err();
+        assert!(error.to_string().contains("cannot be used with the native backend"));
     }
 
     #[test]
