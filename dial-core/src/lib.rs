@@ -47,7 +47,8 @@ pub enum ModelSize {
     /// Qwen3-VL-8B through DIAL's native distributed backend.
     #[value(name = "8b")]
     B8,
-    /// Qwen3.8-27B through DIAL's native distributed backend.
+    /// Qwen3.8-27B. Uses DIAL's native backend unless both GGUF weights and
+    /// the GGML adapter are supplied, in which case the GGML backend is selected.
     #[value(name = "27b")]
     B27,
 }
