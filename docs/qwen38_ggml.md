@@ -198,6 +198,17 @@ Orin 的权重计算和统一内存访问仍可能成为瓶颈。一个 token �
 远端层、Thor 本地层和输出头，两板不会自动让单请求 decode 的速度相加。
 不要为了“用满两个板”强制平均分层。新增以下对照拓扑，不覆盖原文件：
 
+单请求、batch=1 追求最低延迟时，直接在 Thor 上运行全部解码层：
+
+```bash
+# Thor：启动 Master，再另开终端运行 Client；Orin 不启动 Worker
+bash run_27b_low_latency.sh master
+bash run_27b_low_latency.sh client
+```
+
+`run_27b_low_latency.sh` 固定选择 Thor-only 拓扑。原来的
+`run_27b_ggml.sh worker/master/client` 仍用于双板实验或多请求吞吐测试。
+
 | 拓扑文件 | Orin 层 | Thor 层 |
 |---|---|---|
 | `topology_qwen38.yml` | 0–15 | 16–63 |
