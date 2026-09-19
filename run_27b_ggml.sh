@@ -45,6 +45,9 @@ common=(--model-size 27b --inference-backend qwen38-ggml --mode "$mode"
     --topology "$topology" --device "${DIAL_DEVICE:-0}" --dtype f16
     --kv-cache-max-len "${DIAL_CONTEXT:-4096}")
 export RUST_LOG=${RUST_LOG:-info}
+# Send one compact layer interval instead of repeated layer names per token.
+# Set SPM_COMPACT_BATCH=0 only for protocol compatibility diagnostics.
+export SPM_COMPACT_BATCH=${SPM_COMPACT_BATCH:-1}
 if [[ "$mode" == worker ]]; then
     exec "$bin" "${common[@]}" --name "${DIAL_WORKER_NAME:-worker0}" \
         --address "${DIAL_WORKER_BIND:-192.168.2.88:10128}" "$@"
