@@ -140,9 +140,12 @@ impl ClientPool {
 
 impl Client {
     fn compact_batch_enabled() -> bool {
-        matches!(
+        // Compact range messages avoid serializing every layer name for every
+        // generated token. Prefer them by default when the worker advertises
+        // support; retain an explicit escape hatch for compatibility tests.
+        !matches!(
             std::env::var("SPM_COMPACT_BATCH").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+            Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO")
         )
     }
 
@@ -150,11 +153,11 @@ impl Client {
         static LOGGED: Once = Once::new();
         LOGGED.call_once(|| {
             if range_enabled {
-                log::info!("spm compact range batch enabled by SPM_COMPACT_BATCH");
+                log::info!("spm compact range batch enabled");
             } else if enabled {
-                log::info!("spm compact batch enabled by SPM_COMPACT_BATCH");
+                log::info!("spm compact batch enabled");
             } else {
-                log::info!("spm compact batch disabled; set SPM_COMPACT_BATCH=1 to test it");
+                log::info!("spm compact batch disabled by SPM_COMPACT_BATCH=0");
             }
         });
     }
