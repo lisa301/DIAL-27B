@@ -59,6 +59,13 @@ struct Graph {
     T * positions = nullptr;
     T * rows = nullptr;
     T * mask = nullptr;
+    // Host-side input staging is retained with the graph. Decode used to
+    // allocate three vectors and upload the whole attention mask for every
+    // token, even though only one newly-visible position changes.
+    std::vector<int32_t> host_positions;
+    std::vector<int64_t> host_rows;
+    std::vector<ggml_fp16_t> host_mask;
+    int64_t mask_visible_through = -1;
     int64_t tokens;
     int64_t attention_length;
     Graph(ggml_backend_t backend, int64_t n, size_t layers = 1, int64_t kv_length = 0) :
@@ -460,16 +467,46 @@ struct State {
     static void set_attention_inputs(Graph & g, int64_t position) {
         if (!g.positions) return;
         int64_t tokens = g.tokens;
-        std::vector<int32_t> pos(tokens); std::vector<int64_t> rows(tokens);
-        for (int64_t i = 0; i < tokens; ++i) { pos[i] = position+i; rows[i] = position+i; }
-        ggml_backend_tensor_set(g.positions, pos.data(), 0, tokens*sizeof(int32_t));
-        ggml_backend_tensor_set(g.rows, rows.data(), 0, tokens*sizeof(int64_t));
-        std::vector<ggml_fp16_t> mask(ggml_nelements(g.mask), ggml_fp32_to_fp16(-INFINITY));
+        g.host_positions.resize(tokens);
+        g.host_rows.resize(tokens);
         for (int64_t i = 0; i < tokens; ++i) {
-            std::fill(mask.begin()+i*g.attention_length,
-                      mask.begin()+i*g.attention_length+position+i+1, ggml_fp32_to_fp16(0.0f));
+            g.host_positions[i] = position+i;
+            g.host_rows[i] = position+i;
         }
-        ggml_backend_tensor_set(g.mask, mask.data(), 0, ggml_nbytes(g.mask));
+        ggml_backend_tensor_set(g.positions, g.host_positions.data(), 0, tokens*sizeof(int32_t));
+        ggml_backend_tensor_set(g.rows, g.host_rows.data(), 0, tokens*sizeof(int64_t));
+
+        const auto hidden = ggml_fp32_to_fp16(-INFINITY);
+        const auto visible = ggml_fp32_to_fp16(0.0f);
+        const size_t mask_elements = ggml_nelements(g.mask);
+        const bool new_request = position == 0;
+        if (g.host_mask.size() != mask_elements || new_request) {
+            g.host_mask.assign(mask_elements, hidden);
+            g.mask_visible_through = -1;
+        }
+
+        // A one-token decode only reveals one additional key position. Keep
+        // the already-uploaded prefix and transfer the new suffix instead of
+        // rebuilding and copying the complete mask on every token.
+        if (tokens == 1 && !new_request) {
+            const int64_t first = g.mask_visible_through + 1;
+            const int64_t last = position;
+            if (first <= last) {
+                std::fill(g.host_mask.begin()+first, g.host_mask.begin()+last+1, visible);
+                ggml_backend_tensor_set(g.mask, g.host_mask.data()+first,
+                                        first*sizeof(ggml_fp16_t),
+                                        (last-first+1)*sizeof(ggml_fp16_t));
+                g.mask_visible_through = last;
+            }
+            return;
+        }
+
+        for (int64_t i = 0; i < tokens; ++i) {
+            std::fill(g.host_mask.begin()+i*g.attention_length,
+                      g.host_mask.begin()+i*g.attention_length+position+i+1, visible);
+        }
+        ggml_backend_tensor_set(g.mask, g.host_mask.data(), 0, ggml_nbytes(g.mask));
+        if (tokens == 1) g.mask_visible_through = position;
     }
     void forward(const float * input, int64_t tokens, int64_t position, float * output, bool device_io) {
         check_position(tokens, position);
